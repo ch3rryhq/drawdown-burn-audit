@@ -77,7 +77,7 @@ import {IFeeStrategy} from "./interfaces/IFeeStrategy.sol";
 ///      cannot grow. Once both have crossed it all the way it holds only the token it bought:
 ///      {buildWall} then takes it out and burns that token, and the next call lays a new wall under the
 ///      ATH of the day. Token the wall earns as fees is burned too. Only the owner takes the wall out:
-///      {withdrawWall} sends both currencies to an address of their choosing (not the vault),
+///      {withdrawWall} puts both currencies back in the vault, its reserve as bank (counted as no fee),
 ///      {burnWall} sends its reserve to be bought back and burned, and {moveWall} lays it again under
 ///      the current ATH.
 ///
@@ -186,7 +186,7 @@ contract DrawdownBurnStrategy is IFeeStrategy, IUnlockCallback, Ownable2Step, Re
     event Burned(uint256 tokens);
     event WallBuilt(int24 lower, int24 upper, uint128 liquidity, uint256 reserveAdded);
     event WallBurned(uint256 tokens);
-    event WallWithdrawn(address indexed to, uint256 reserve, uint256 tokens);
+    event WallWithdrawn(uint256 reserve, uint256 tokens);
     event WallSentToBurn(uint256 reserve, uint256 tokens);
     event WallTakenDown(uint256 reserve, uint256 tokens);
     event MaxPerBuySet(uint256 amount);
@@ -204,7 +204,6 @@ contract DrawdownBurnStrategy is IFeeStrategy, IUnlockCallback, Ownable2Step, Re
     error TooManyExcluded();
     error InvalidExcluded();
     error InvalidAth();
-    error InvalidRecipient();
     error PoolMismatch();
     error Unsettled();
     error PoolLocked();
@@ -331,7 +330,7 @@ contract DrawdownBurnStrategy is IFeeStrategy, IUnlockCallback, Ownable2Step, Re
             _takeDownWall();
             _build();
         } else {
-            _withdrawWall(to);
+            _withdrawWall();
         }
         _burnHeld();
         return "";
@@ -622,16 +621,18 @@ contract DrawdownBurnStrategy is IFeeStrategy, IUnlockCallback, Ownable2Step, Re
         emit WallTakenDown(reserveOut, tokens);
     }
 
-    function _withdrawWall(address to) internal {
+    /// @dev The whole wall back to the vault: its reserve as bank -- neither a fee nor pending -- and
+    ///      any token it holds alongside, for the owner to withdraw from there.
+    function _withdrawWall() internal {
         Wall memory w = wall;
         if (w.liquidity != 0) _modify(w.lower, w.upper, -int256(uint256(w.liquidity)));
         wall = Wall(0, 0, 0);
         int256 r = poolManager.currencyDelta(address(this), currency1);
         uint256 reserveOut = r > 0 ? uint256(r) : 0;
-        if (reserveOut != 0) poolManager.take(currency1, to, reserveOut);
-        uint256 tokensOut = _takeToken(to);
+        if (reserveOut != 0) _toVault(reserveOut);
+        uint256 tokensOut = _takeToken(address(vault));
         _requireSettled();
-        emit WallWithdrawn(to, reserveOut, tokensOut);
+        emit WallWithdrawn(reserveOut, tokensOut);
     }
 
     /// @notice What the wall holds now, in the reserve and in the token, fees not included.
@@ -713,12 +714,12 @@ contract DrawdownBurnStrategy is IFeeStrategy, IUnlockCallback, Ownable2Step, Re
         poolManager.unlock(abi.encode(MOVE_WALL, address(0)));
     }
 
-    /// @notice Take the whole wall out, both currencies to `to`. What is pending stays pending. Not
-    ///         to the vault, where its reserve would read as a fee.
-    function withdrawWall(address to) external onlyOwner nonReentrant {
-        if (to == address(0) || to == address(vault)) revert InvalidRecipient();
+    /// @notice Take the whole wall out and keep it in the vault: its reserve joins the bank -- never
+    ///         split, spent or laid again -- and any token it holds goes there too. The owner takes
+    ///         either out with {withdrawFromVault}. What is pending stays pending.
+    function withdrawWall() external onlyOwner nonReentrant {
         if (poolManager.isUnlocked()) revert PoolLocked();
-        poolManager.unlock(abi.encode(WITHDRAW, to));
+        poolManager.unlock(abi.encode(WITHDRAW, address(0)));
     }
 
     /// @notice Withdraw from the vault. What it takes from the reserve comes out of {pendingWall}
@@ -739,7 +740,7 @@ contract DrawdownBurnStrategy is IFeeStrategy, IUnlockCallback, Ownable2Step, Re
     }
 
     /// @notice Hand the vault back to this contract's owner, to install another strategy. The wall
-    ///         stays with this contract until {withdrawWall}.
+    ///         stays with this contract until {withdrawWall}, {burnWall} or {moveWall}.
     function releaseVault() external onlyOwner {
         _observe();
         vault.transferOwnership(owner());

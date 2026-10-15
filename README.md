@@ -49,7 +49,7 @@ Build: `forge build` (solc 0.8.26, cancun, optimizer 200 runs). Dependencies are
   circulating market cap equals 40% of the ATH. Permissionless `buildWall()` adds pending ARB, or, once
   the price has crossed the wall entirely, removes it and burns the tokens it bought. The wall does not
   follow a later ATH.
-- **Owner only**: `withdrawWall(to)`, `burnWall()` (wall ARB to the buyback pot, wall tokens burned),
+- **Owner only**: `withdrawWall()` (wall back to the vault as bank), `burnWall()` (wall ARB to the buyback pot, wall tokens burned),
   `moveWall()` (re-lay under the current ATH), `withdrawFromVault`, `releaseVault`, `setExcluded`,
   `setMaxPerBuy`, `setWallWidth`, `lowerAth` (can only lower the ATH). `Ownable2Step`; renounce disabled. Single-key owner by design.
 
