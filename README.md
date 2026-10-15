@@ -51,7 +51,7 @@ Build: `forge build` (solc 0.8.26, cancun, optimizer 200 runs). Dependencies are
   follow a later ATH.
 - **Owner only**: `withdrawWall(to)`, `burnWall()` (wall ARB to the buyback pot, wall tokens burned),
   `moveWall()` (re-lay under the current ATH), `withdrawFromVault`, `releaseVault`, `setExcluded`,
-  `setMaxPerBuy`, `setWallWidth`. `Ownable2Step`; renounce disabled. Single-key owner by design.
+  `setMaxPerBuy`, `setWallWidth`, `lowerAth` (can only lower the ATH). `Ownable2Step`; renounce disabled. Single-key owner by design.
 
 ## Please look hardest at
 
@@ -71,4 +71,6 @@ Build: `forge build` (solc 0.8.26, cancun, optimizer 200 runs). Dependencies are
    (it fails silently; buybacks then rely on `buyback()`).
 6. `circulatingSupply()` assumptions (excluded list ≤ 8, held balance, burns lowering the market cap).
 
-Fork tests (23 + deploy) exist against the live pool and are not included here.
+Fork tests (34 + deploy) exist against the live pool and are not included here.
+
+A first audit round's findings are fixed in this version (step-limited first reading, bank counted at handover, anchor-gated wall add/burn, buybacks capped by the last hourly close, one-spacing in-swap slip, own-buyback burn turn, split-before-withdraw, validated exclusions, no wall withdrawal to the vault).
