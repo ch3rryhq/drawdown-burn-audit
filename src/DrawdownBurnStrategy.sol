@@ -40,40 +40,51 @@ import {IFeeStrategy} from "./interfaces/IFeeStrategy.sol";
 /// @dev **The market cap.** In the reserve, with no oracle: the circulating supply -- total supply
 ///      less the balances of the {excluded} addresses and what this contract holds for burning --
 ///      times the pool's price at the block's anchor. The block's first call anchors the block at the
-///      pool's tick, moved at most {MAX_ANCHOR_STEP} (~2%) from the last anchor; the market cap and the
-///      tier are read there, once a block. The ATH ({athMcap}) is the highest hourly close -- the last
-///      reading of a clock hour, taken when the next hour's first reading comes -- or the one given at
-///      deploy if higher: a wick inside an hour is never an ATH. So a pump cannot buy high or flip a
-///      tier within a block. Held to an hour's close, paid for every block -- a round trip through the
-///      pool's fee each time -- it can lift the ATH, which lowers the tiers and places a later wall
-///      higher; the owner can always take the wall back. Burns and transfers to an excluded address lower the
-///      circulating supply, and with it the market cap, as they would on any tracker.
+///      pool's tick, moved at most {MAX_ANCHOR_STEP} (~2%) from the last anchor -- from deployment on,
+///      the first reading included; the market cap and the tier are read there, once a block. The ATH
+///      ({athMcap}) is the highest hourly close -- the anchor that closes a clock hour, taken when the
+///      next hour's first reading comes -- or the one given at deploy if higher: a wick inside an hour
+///      is never an ATH. Burns and transfers to an excluded address lower the circulating supply, and
+///      with it the market cap, as they would on any tracker.
+///
+///      **What a pump can do.** Within a block, nothing: it cannot buy high, flip a tier, lay the wall
+///      or burn it. Held, it is followed: any call -- a trade, {buyback}, {buildWall} -- steps the
+///      anchor ~2% a block toward it, at no cost but gas and the capital held against arbitrage. Held
+///      over an hour's close it lifts the ATH, which lowers the tiers and would place a new wall higher;
+///      the owner can bring the ATH back down with {lowerAth} and take the wall back. Buybacks are capped
+///      by the last hour's close as well as the anchor, so a held pump does not make them buy high
+///      before an hour has closed there.
 ///
 ///      **Where a fee goes.** Split when it arrives, by its block's tier: the burned share into the
-///      {pot}, the rest into {pendingWall}. The pot is spent whatever the tier later reads.
+///      {pot}, the rest into {pendingWall}. The pot is spent whatever the tier later reads. Nothing is
+///      split before the vault is handed over: the first reading that finds the vault ours credits it
+///      and counts what it holds then as the bank.
 ///
-///      **Buying.** The whole pot, at most {maxPerBuy}, at most once a block, never more than ~2%
-///      above the block's anchor. What it buys is burned by the next call -- the next trade -- or by
-///      anyone through {burnHeld}: a buyback and its burn together do not fit in the vault's gas cap,
-///      because the token checkpoints every balance, so the two take turns. It runs inside the swap
-///      that brought the fee, on the trader's gas, within the vault's 400k cap; anyone may also
-///      call {buyback} on their own gas.
+///      **Buying.** The whole pot, at most {maxPerBuy}, at most once a block, never more than
+///      {MAX_SLIP_TICKS} (~2%) above the lowest of the price, the block's anchor and the last hour's
+///      close -- {INSIDE_SLIP_TICKS} (one spacing) inside a swap, so ticks seeded above the price cannot
+///      run it out of gas. What it buys is burned by the next call -- the next trade -- or by anyone
+///      through {burnHeld}: a buyback and its burn together do not fit in the vault's gas cap, because
+///      the token checkpoints every balance, so the two take turns; only its own buyback's tokens take
+///      the turn. It runs inside the swap that brought the fee, on the trader's gas, within the vault's
+///      400k cap ({BuybackSkipped} when it does not fit); anyone may also call {buyback} on their own gas.
 ///
 ///      **The wall.** One position, reserve only, {wallWidth} ticks deep, its upper edge at the price
-///      where the circulating market cap is {WALL_BPS} of the ATH (60% under it), rounded down to the pool's spacing -- the ATH
-///      of when it was laid: it does not follow a later high. Anyone may call {buildWall}, outside a
-///      swap and on their own gas, to add what is pending to it; nothing is added while the price is at
-///      or inside its top, where a reserve-only position cannot grow. Once the price has crossed it all
-///      the way it holds only the token it bought: {buildWall} then takes it out and burns that token,
-///      and the next call lays a new wall under the ATH of the day. Token the wall earns as fees is
-///      burned too. Only the owner takes the wall out: {withdrawWall} sends both currencies to an
-///      address of their choosing, {burnWall} sends its reserve to be bought back and burned, and
-///      {moveWall} lays it again under the current ATH.
+///      where the circulating market cap is {WALL_BPS} of the ATH (60% under it), rounded down to the
+///      pool's spacing -- the ATH of when it was laid: it does not follow a later high. Anyone may call
+///      {buildWall}, outside a swap and on their own gas, to add what is pending to it; nothing is added
+///      while the price or the block's anchor is at or inside its top, where a reserve-only position
+///      cannot grow. Once both have crossed it all the way it holds only the token it bought:
+///      {buildWall} then takes it out and burns that token, and the next call lays a new wall under the
+///      ATH of the day. Token the wall earns as fees is burned too. Only the owner takes the wall out:
+///      {withdrawWall} sends both currencies to an address of their choosing (not the vault),
+///      {burnWall} sends its reserve to be bought back and burned, and {moveWall} lays it again under
+///      the current ATH.
 ///
 ///      **The money.** It owns the vault, as {LiquidityStrategy} did, because the vault can only hand
 ///      a strategy its whole balance and the bank must stay put. Reserve stays in the vault until a
-///      buyback or the wall spends it; {pot} and {pendingWall} only count it. Fees received before it
-///      was installed -- the bank -- are never counted. It keeps {LiquidityStrategy}'s owner surface
+///      buyback or the wall spends it; {pot} and {pendingWall} only count it. What the vault held when
+///      it was handed over -- the bank -- is never counted. It keeps {LiquidityStrategy}'s owner surface
 ///      (`reserve`, `vault`, `withdrawFromVault`, `releaseVault`).
 // The loop reads at most MAX_EXCLUDED balances of our own token. The timestamp only buckets hours.
 // Strict equalities here compare blocks, ticks and zero, never balances an attacker can nudge.
@@ -94,6 +105,9 @@ contract DrawdownBurnStrategy is IFeeStrategy, IUnlockCallback, Ownable2Step, Re
     int24 public constant MAX_SLIP_TICKS = 200;
     /// @notice How far the anchor may move in one block.
     int24 public constant MAX_ANCHOR_STEP = 200;
+    /// @notice How far above the block's anchor a buyback inside a swap may go: one spacing, so it
+    ///         crosses at most a tick or two whoever has initialised ticks above the price.
+    int24 public constant INSIDE_SLIP_TICKS = 60;
     /// @notice Most addresses left out of the circulating supply: each costs a read per block.
     uint256 public constant MAX_EXCLUDED = 8;
     /// @notice Gas a burn needs, checkpoints included, before one is tried inside a swap.
@@ -139,6 +153,9 @@ contract DrawdownBurnStrategy is IFeeStrategy, IUnlockCallback, Ownable2Step, Re
         uint64 lastBuy;
         uint16 burnBps; // the block's tier
         uint32 hour; // the clock hour of the block
+        int24 closeTick; // the anchor that closed the last hour
+        bool holding; // a buyback's tokens wait to be burned
+        bool active; // the vault is ours and its bank has been counted
     }
 
     /// @notice The circulating market cap at the last anchor: the running close of its hour.
@@ -175,6 +192,9 @@ contract DrawdownBurnStrategy is IFeeStrategy, IUnlockCallback, Ownable2Step, Re
     event MaxPerBuySet(uint256 amount);
     event WallWidthSet(int24 ticks);
     event ExcludedSet(address[] excluded);
+    event Activated(uint256 bank);
+    event BuybackSkipped(uint256 amount);
+    event AthLowered(uint256 mcap);
 
     error NotVault();
     error NotPoolManager();
@@ -182,6 +202,8 @@ contract DrawdownBurnStrategy is IFeeStrategy, IUnlockCallback, Ownable2Step, Re
     error InvalidMaxPerBuy();
     error InvalidWallWidth();
     error TooManyExcluded();
+    error InvalidExcluded();
+    error InvalidAth();
     error InvalidRecipient();
     error PoolMismatch();
     error Unsettled();
@@ -219,8 +241,8 @@ contract DrawdownBurnStrategy is IFeeStrategy, IUnlockCallback, Ownable2Step, Re
 
         _setMaxPerBuy(maxPerBuy_);
         _setWallWidth(wallWidth_);
-        // Credit whatever already sits in the vault first: reserve that arrived without a sync is the
-        // bank's too, and would otherwise read as a fee the first time anyone syncs.
+        // Counted again when the vault is handed over (see _observe); this keeps the views sane until then.
+        // Reserve that arrived without a sync is the bank's too, so the vault is credited first.
         vault_.sync(reserve_);
         accounted = vault_.totalReceived(reserve_);
         _setExcluded(excluded_);
@@ -232,7 +254,17 @@ contract DrawdownBurnStrategy is IFeeStrategy, IUnlockCallback, Ownable2Step, Re
         // Every slot a trade writes is written once here, so a trade only ever rewrites it: a first
         // write costs ~20k more, enough to push a buyback inside a swap past the vault's gas cap. The
         // wei of each is never spendable.
-        anchor = Anchor(0, tick, 1, uint16(_tierBps(mcap, ath)), uint32(block.timestamp / 1 hours));
+        // Anchored now, so the first reading after deployment steps from here like any other.
+        anchor = Anchor(
+            uint64(block.number),
+            tick,
+            1,
+            uint16(_tierBps(mcap, ath)),
+            uint32(block.timestamp / 1 hours),
+            tick,
+            false,
+            false
+        );
         _pot = 1;
         _pendingWall = 1;
         _totals = Totals(1, 1);
@@ -249,22 +281,26 @@ contract DrawdownBurnStrategy is IFeeStrategy, IUnlockCallback, Ownable2Step, Re
         if (!poolManager.isUnlocked()) return;
         // Someone mid-payment has synced a currency; a sync of ours would clobber it.
         if (Currency.unwrap(poolManager.getSyncedCurrency()) != address(0)) return;
-        // A buyback and its burn do not both fit in the vault's cap, so they take turns.
-        if (token.balanceOf(address(this)) != 0) {
+        // A buyback and its burn do not both fit in the vault's cap, so they take turns. Only our own
+        // buyback's tokens take the turn: tokens sent here wait for burnHeld or the next unlock.
+        if (anchor.holding) {
             if (gasleft() > BURN_GAS) _burnHeld();
             return;
         }
         uint256 amount = _due();
         // Kept apart, so a buyback that fails cannot roll back what was just split.
         if (amount != 0) {
-            try this.buyInside(amount) {} catch {}
+            try this.buyInside(amount) {}
+            catch {
+                emit BuybackSkipped(amount);
+            }
         }
     }
 
     /// @notice Only this contract, from {onFeeReceived}.
     function buyInside(uint256 amount) external nonReentrant {
         if (msg.sender != address(this)) revert NotSelf();
-        _buy(amount);
+        _buy(amount, INSIDE_SLIP_TICKS);
     }
 
     /// @notice Run the buyback outside a swap, on the caller's gas. Same rules as inside one.
@@ -286,7 +322,7 @@ contract DrawdownBurnStrategy is IFeeStrategy, IUnlockCallback, Ownable2Step, Re
         _observe();
         if (action == BUY) {
             uint256 amount = _due();
-            if (amount != 0) _buy(amount);
+            if (amount != 0) _buy(amount, MAX_SLIP_TICKS);
         } else if (action == BUILD) {
             _build();
         } else if (action == BURN_WALL) {
@@ -381,12 +417,18 @@ contract DrawdownBurnStrategy is IFeeStrategy, IUnlockCallback, Ownable2Step, Re
         mcap = lastMcap;
         if (a.block_ == block.number) return (a, ath, mcap);
         uint32 hour = uint32(block.timestamp / 1 hours);
+        int24 closeTick = a.closeTick;
         // The first reading of a new hour closes the last one: its last reading is its close.
-        if (hour != a.hour && mcap > ath) ath = mcap;
+        if (hour != a.hour) {
+            closeTick = a.tick;
+            if (mcap > ath) ath = mcap;
+        }
         (, int24 tick,,) = poolManager.getSlot0(poolId);
         tick = _stepped(a, tick);
         mcap = marketCapAt(tick);
-        a = Anchor(uint64(block.number), tick, a.lastBuy, uint16(_tierBps(mcap, ath)), hour);
+        a = Anchor(
+            uint64(block.number), tick, a.lastBuy, uint16(_tierBps(mcap, ath)), hour, closeTick, a.holding, a.active
+        );
     }
 
     /// @dev Anchor the block, lift the ATH, read the tier once for it, and split what arrived.
@@ -403,6 +445,15 @@ contract DrawdownBurnStrategy is IFeeStrategy, IUnlockCallback, Ownable2Step, Re
                 emit NewHigh(ath);
             }
         }
+        if (!a.active) {
+            // Nothing is ours to split until the vault is: then the bank is whatever it holds.
+            if (vault.owner() != address(this)) return;
+            vault.sync(reserve);
+            accounted = vault.totalReceived(reserve);
+            anchor.active = true;
+            emit Activated(IERC20(reserve).balanceOf(address(vault)));
+            return;
+        }
 
         uint256 total = vault.totalReceived(reserve);
         uint256 fresh = total - accounted;
@@ -416,7 +467,6 @@ contract DrawdownBurnStrategy is IFeeStrategy, IUnlockCallback, Ownable2Step, Re
 
     /// @dev The tick moved at most MAX_ANCHOR_STEP from the last anchor.
     function _stepped(Anchor memory a, int24 tick) internal pure returns (int24) {
-        if (a.block_ == 0) return tick;
         if (tick > a.tick + MAX_ANCHOR_STEP) return a.tick + MAX_ANCHOR_STEP;
         if (tick < a.tick - MAX_ANCHOR_STEP) return a.tick - MAX_ANCHOR_STEP;
         return tick;
@@ -433,11 +483,14 @@ contract DrawdownBurnStrategy is IFeeStrategy, IUnlockCallback, Ownable2Step, Re
         if (amount > held) amount = held;
     }
 
-    function _buy(uint256 amount) internal {
-        // Buying the token, currency0, raises the tick.
+    function _buy(uint256 amount, int24 slip) internal {
+        // Buying the token, currency0, raises the tick. From the lowest of the price now, the block's
+        // anchor and the last hour's close: a pump held for a few blocks cannot make it buy high.
         (, int24 tick,,) = poolManager.getSlot0(poolId);
-        int24 at = anchor.tick;
-        int24 limit = (tick < at ? tick : at) + MAX_SLIP_TICKS;
+        Anchor memory a = anchor;
+        int24 base = tick < a.tick ? tick : a.tick;
+        if (a.closeTick < base) base = a.closeTick;
+        int24 limit = base + slip;
         if (limit > TickMath.MAX_TICK - 1) limit = TickMath.MAX_TICK - 1;
         // Already at or past it: nothing this block. v4 would refuse a limit already crossed.
         if (tick >= limit) return;
@@ -462,6 +515,7 @@ contract DrawdownBurnStrategy is IFeeStrategy, IUnlockCallback, Ownable2Step, Re
 
         _pot -= paid;
         anchor.lastBuy = uint64(block.number);
+        anchor.holding = true;
         _totals.spent += uint128(paid);
         emit BoughtBack(paid, got);
     }
@@ -470,6 +524,7 @@ contract DrawdownBurnStrategy is IFeeStrategy, IUnlockCallback, Ownable2Step, Re
     ///      and anything sent to it.
     function _burnHeld() internal {
         uint256 held = token.balanceOf(address(this));
+        if (anchor.holding) anchor.holding = false;
         if (held == 0) return;
         token.burn(held);
         _totals.burned += uint128(held);
@@ -484,9 +539,12 @@ contract DrawdownBurnStrategy is IFeeStrategy, IUnlockCallback, Ownable2Step, Re
     /* ---------------------------------------------------------------- the wall */
 
     function _build() internal {
+        // The price now and the block's anchor must agree, so a pump or a dump inside one transaction
+        // can neither open the wall to pending reserve nor read it as crossed.
         (, int24 tick,,) = poolManager.getSlot0(poolId);
+        int24 at = anchor.tick;
         Wall memory w = wall;
-        if (w.liquidity != 0 && tick < w.lower) {
+        if (w.liquidity != 0 && tick < w.lower && at < w.lower) {
             // Crossed all the way: the wall is all token now. Burn it; the wall is laid anew later.
             _modify(w.lower, w.upper, -int256(uint256(w.liquidity)));
             wall = Wall(0, 0, 0);
@@ -502,7 +560,7 @@ contract DrawdownBurnStrategy is IFeeStrategy, IUnlockCallback, Ownable2Step, Re
         }
         (int24 lower, int24 upper) = wallTarget();
         // At or inside the wall's top a reserve-only position cannot be added to.
-        if (tick < upper) return;
+        if (tick < upper || at < upper) return;
         uint256 pending = _pendingWall - 1;
         uint128 liquidity = LiquidityAmounts.getLiquidityForAmount1(
             TickMath.getSqrtPriceAtTick(lower), TickMath.getSqrtPriceAtTick(upper), pending
@@ -632,7 +690,14 @@ contract DrawdownBurnStrategy is IFeeStrategy, IUnlockCallback, Ownable2Step, Re
         _setExcluded(excluded_);
     }
 
-    /// @notice Take the whole wall out, both currencies to `to`. What is pending stays pending.
+    /// @notice Lower the ATH, never raise it: the way back from an ATH lifted by a pump held over an
+    ///         hour's close.
+    function lowerAth(uint256 mcap) external onlyOwner {
+        if (mcap >= athMcap || mcap == 0) revert InvalidAth();
+        athMcap = mcap;
+        emit AthLowered(mcap);
+    }
+
     /// @notice Take the whole wall out and send its reserve to be bought back and burned, whatever
     ///         the tier, at the buyback's usual pace and limits. Token it holds is burned at once.
     function burnWall() external onlyOwner nonReentrant {
@@ -648,8 +713,10 @@ contract DrawdownBurnStrategy is IFeeStrategy, IUnlockCallback, Ownable2Step, Re
         poolManager.unlock(abi.encode(MOVE_WALL, address(0)));
     }
 
+    /// @notice Take the whole wall out, both currencies to `to`. What is pending stays pending. Not
+    ///         to the vault, where its reserve would read as a fee.
     function withdrawWall(address to) external onlyOwner nonReentrant {
-        if (to == address(0)) revert InvalidRecipient();
+        if (to == address(0) || to == address(vault)) revert InvalidRecipient();
         if (poolManager.isUnlocked()) revert PoolLocked();
         poolManager.unlock(abi.encode(WITHDRAW, to));
     }
@@ -657,6 +724,9 @@ contract DrawdownBurnStrategy is IFeeStrategy, IUnlockCallback, Ownable2Step, Re
     /// @notice Withdraw from the vault. What it takes from the reserve comes out of {pendingWall}
     ///         first, then the pot, as far as the vault no longer covers them.
     function withdrawFromVault(address token_, address to, uint256 amount) external onlyOwner {
+        // Split what has arrived first, so the counters are current before the shortfall is read.
+        vault.sync(reserve);
+        _observe();
         vault.withdraw(token_, to, amount);
         if (token_ != reserve) return;
         uint256 held = IERC20(reserve).balanceOf(address(vault));
@@ -671,6 +741,7 @@ contract DrawdownBurnStrategy is IFeeStrategy, IUnlockCallback, Ownable2Step, Re
     /// @notice Hand the vault back to this contract's owner, to install another strategy. The wall
     ///         stays with this contract until {withdrawWall}.
     function releaseVault() external onlyOwner {
+        _observe();
         vault.transferOwnership(owner());
     }
 
@@ -695,6 +766,13 @@ contract DrawdownBurnStrategy is IFeeStrategy, IUnlockCallback, Ownable2Step, Re
 
     function _setExcluded(address[] memory excluded_) private {
         if (excluded_.length > MAX_EXCLUDED) revert TooManyExcluded();
+        // A duplicate, or this contract (already left out), would be subtracted twice.
+        for (uint256 i = 0; i < excluded_.length; i++) {
+            if (excluded_[i] == address(this) || excluded_[i] == address(0)) revert InvalidExcluded();
+            for (uint256 j = 0; j < i; j++) {
+                if (excluded_[j] == excluded_[i]) revert InvalidExcluded();
+            }
+        }
         _excluded = excluded_;
         emit ExcludedSet(excluded_);
     }
