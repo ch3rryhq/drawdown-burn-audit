@@ -219,6 +219,9 @@ contract DrawdownBurnStrategy is IFeeStrategy, IUnlockCallback, Ownable2Step, Re
 
         _setMaxPerBuy(maxPerBuy_);
         _setWallWidth(wallWidth_);
+        // Credit whatever already sits in the vault first: reserve that arrived without a sync is the
+        // bank's too, and would otherwise read as a fee the first time anyone syncs.
+        vault_.sync(reserve_);
         accounted = vault_.totalReceived(reserve_);
         _setExcluded(excluded_);
         (, int24 tick,,) = poolManager_.getSlot0(key.toId());
