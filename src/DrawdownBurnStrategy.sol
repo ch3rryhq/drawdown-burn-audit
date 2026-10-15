@@ -81,6 +81,12 @@ import {IFeeStrategy} from "./interfaces/IFeeStrategy.sol";
 ///      {burnWall} sends its reserve to be bought back and burned, and {moveWall} lays it again under
 ///      the current ATH.
 ///
+///      **What "a block" is.** On Arbitrum `block.number` is the L1 block number: it changes about
+///      every 12 seconds, across many L2 blocks. Every per-block rule here -- one anchor, one tier
+///      reading and at most one buyback per block, the anchor's ~2% step -- is per L1 block, on
+///      purpose: the anchor follows a move at most ~2% per ~12 s, and the pot carries over between
+///      the swaps that share an L1 block.
+///
 ///      **The money.** It owns the vault, as {LiquidityStrategy} did, because the vault can only hand
 ///      a strategy its whole balance and the bank must stay put. Reserve stays in the vault until a
 ///      buyback or the wall spends it; {pot} and {pendingWall} only count it. What the vault held when
