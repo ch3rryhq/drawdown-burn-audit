@@ -741,8 +741,8 @@ contract DrawdownBurnStrategy is IFeeStrategy, IUnlockCallback, Ownable2Step, Re
 
     /// @notice Hand the vault back to this contract's owner, to install another strategy. The wall
     ///         stays with this contract until {withdrawWall}, {burnWall} or {moveWall}.
+    /// @dev The way out: depends on nothing but the owner, so no fault elsewhere can block it.
     function releaseVault() external onlyOwner {
-        _observe();
         vault.transferOwnership(owner());
     }
 
