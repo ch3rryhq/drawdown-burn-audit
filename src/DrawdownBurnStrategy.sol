@@ -62,12 +62,14 @@ import {IFeeStrategy} from "./interfaces/IFeeStrategy.sol";
 ///
 ///      **Buying.** The whole pot, at most {maxPerBuy}, at most once a block, never more than
 ///      {MAX_SLIP_TICKS} (~2%) above the lowest of the price, the block's anchor and the last hour's
-///      close -- {INSIDE_SLIP_TICKS} (one spacing) inside a swap, so ticks seeded above the price cannot
+///      close -- one tick spacing inside a swap, so ticks seeded above the price cannot
 ///      run it out of gas. What it buys is burned by the next call -- the next trade -- or by anyone
 ///      through {burnHeld}: a buyback and its burn together do not fit in the vault's gas cap, because
 ///      the token checkpoints every balance, so the two take turns; only its own buyback's tokens take
 ///      the turn. It runs inside the swap that brought the fee, on the trader's gas, within the vault's
 ///      400k cap ({BuybackSkipped} when it does not fit); anyone may also call {buyback} on their own gas.
+///      The vault's notification has no caller check, so anyone holding an unlock can trigger the
+///      in-swap path too: same caps, same price limit, nothing more than {buyback} already allows.
 ///
 ///      **The wall.** One position, reserve only, {wallWidth} ticks deep, its upper edge at the price
 ///      where the circulating market cap is {WALL_BPS} of the ATH (60% under it), rounded down to the
@@ -111,9 +113,6 @@ contract DrawdownBurnStrategy is IFeeStrategy, IUnlockCallback, Ownable2Step, Re
     int24 public constant MAX_SLIP_TICKS = 200;
     /// @notice How far the anchor may move in one block.
     int24 public constant MAX_ANCHOR_STEP = 200;
-    /// @notice How far above the block's anchor a buyback inside a swap may go: one spacing, so it
-    ///         crosses at most a tick or two whoever has initialised ticks above the price.
-    int24 public constant INSIDE_SLIP_TICKS = 60;
     /// @notice Most addresses left out of the circulating supply: each costs a read per block.
     uint256 public constant MAX_EXCLUDED = 8;
     /// @notice Gas a burn needs, checkpoints included, before one is tried inside a swap.
@@ -305,7 +304,8 @@ contract DrawdownBurnStrategy is IFeeStrategy, IUnlockCallback, Ownable2Step, Re
     /// @notice Only this contract, from {onFeeReceived}.
     function buyInside(uint256 amount) external nonReentrant {
         if (msg.sender != address(this)) revert NotSelf();
-        _buy(amount, INSIDE_SLIP_TICKS);
+        // One spacing inside a swap: it crosses at most a tick or two however many are seeded above.
+        _buy(amount, tickSpacing);
     }
 
     /// @notice Run the buyback outside a swap, on the caller's gas. Same rules as inside one.
@@ -406,6 +406,9 @@ contract DrawdownBurnStrategy is IFeeStrategy, IUnlockCallback, Ownable2Step, Re
         if (sqrtP >= TickMath.MAX_SQRT_PRICE) sqrtP = TickMath.MAX_SQRT_PRICE - 1;
         if (sqrtP < TickMath.MIN_SQRT_PRICE) sqrtP = TickMath.MIN_SQRT_PRICE;
         upper = _floor(TickMath.getTickAtSqrtPrice(uint160(sqrtP)));
+        // Kept inside the pool's usable range, however low the ATH was set.
+        int24 minUpper = -_floor(-TickMath.MIN_TICK) + wallWidth;
+        if (upper < minUpper) upper = minUpper;
         lower = upper - wallWidth;
     }
 
@@ -571,10 +574,12 @@ contract DrawdownBurnStrategy is IFeeStrategy, IUnlockCallback, Ownable2Step, Re
         // At or inside the wall's top a reserve-only position cannot be added to.
         if (tick < upper || at < upper) return;
         uint256 pending = _pendingWall - 1;
-        uint128 liquidity = LiquidityAmounts.getLiquidityForAmount1(
-            TickMath.getSqrtPriceAtTick(lower), TickMath.getSqrtPriceAtTick(upper), pending
-        );
-        if (liquidity == 0) return;
+        // amount1 / (sqrt(upper) - sqrt(lower)), X96. Past uint128 -- a range at an absurd price,
+        // such as an ATH lowered to nothing -- there is no wall to lay: nothing, rather than a revert.
+        uint256 raw =
+            FullMath.mulDiv(pending, 1 << 96, TickMath.getSqrtPriceAtTick(upper) - TickMath.getSqrtPriceAtTick(lower));
+        if (raw == 0 || raw > type(uint128).max) return;
+        uint128 liquidity = uint128(raw);
         // Adding to the position also collects its fees, netted into the same deltas.
         _modify(lower, upper, int256(uint256(liquidity)));
         wall = Wall(lower, upper, w.liquidity + liquidity);
