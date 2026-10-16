@@ -71,6 +71,8 @@ Build: `forge build` (solc 0.8.26, cancun, optimizer 200 runs). Dependencies are
    (it fails silently; buybacks then rely on `buyback()`).
 6. `circulatingSupply()` assumptions (excluded list ≤ 8, held balance, burns lowering the market cap).
 
-Fork tests (34 + deploy) exist against the live pool and are not included here.
+Fork tests (37 + deploy) exist against the live pool and are not included here.
 
 A first audit round's findings are fixed in this version (step-limited first reading, bank counted at handover, anchor-gated wall add/burn, buybacks capped by the last hourly close, one-spacing in-swap slip, own-buyback burn turn, split-before-withdraw, validated exclusions, no wall withdrawal to the vault).
+
+Round 2 findings are fixed too: releaseVault clears the activation and counters, every handover re-snapshots the bank and resets pot/pendingWall, activation requires vault.strategy == this, lowerAth applies a pending close first and caps the running close.

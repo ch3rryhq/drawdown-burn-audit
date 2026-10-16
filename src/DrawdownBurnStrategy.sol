@@ -452,9 +452,13 @@ contract DrawdownBurnStrategy is IFeeStrategy, IUnlockCallback, Ownable2Step, Re
         }
         if (!a.active) {
             // Nothing is ours to split until the vault is: then the bank is whatever it holds.
-            if (vault.owner() != address(this)) return;
+            // Ours, and pointing here: a vault handed over while it names another strategy is not used.
+            if (vault.owner() != address(this) || address(vault.strategy()) != address(this)) return;
             vault.sync(reserve);
             accounted = vault.totalReceived(reserve);
+            // At every handover, not only the first: nothing counted before it survives.
+            _pot = 1;
+            _pendingWall = 1;
             anchor.active = true;
             emit Activated(IERC20(reserve).balanceOf(address(vault)));
             return;
@@ -700,8 +704,12 @@ contract DrawdownBurnStrategy is IFeeStrategy, IUnlockCallback, Ownable2Step, Re
     /// @notice Lower the ATH, never raise it: the way back from an ATH lifted by a pump held over an
     ///         hour's close.
     function lowerAth(uint256 mcap) external onlyOwner {
+        // Apply any hour close still pending first, or the next reading would lift it back.
+        _observe();
         if (mcap >= athMcap || mcap == 0) revert InvalidAth();
         athMcap = mcap;
+        // The running close of this hour may be the pump itself: it closes no higher than this.
+        if (lastMcap > mcap) lastMcap = mcap;
         emit AthLowered(mcap);
     }
 
@@ -748,7 +756,12 @@ contract DrawdownBurnStrategy is IFeeStrategy, IUnlockCallback, Ownable2Step, Re
     /// @notice Hand the vault back to this contract's owner, to install another strategy. The wall
     ///         stays with this contract until {withdrawWall}, {burnWall} or {moveWall}.
     /// @dev The way out: depends on nothing but the owner, so no fault elsewhere can block it.
+    ///      Whatever the counters held is the vault's again: nothing is split or spent until the vault
+    ///      is handed back, and then all it holds is bank. Storage writes only, so nothing can block it.
     function releaseVault() external onlyOwner {
+        anchor.active = false;
+        _pot = 1;
+        _pendingWall = 1;
         vault.transferOwnership(owner());
     }
 
